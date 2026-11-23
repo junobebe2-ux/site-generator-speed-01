@@ -6,14 +6,53 @@ const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June',
 
 const ESC_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 const ESC_RE = /[&<>"']/g;
+const ESC_TEST = /[&<>"']/;
 function esc(s) {
+  if (!ESC_TEST.test(s)) return s;
   return s.replace(ESC_RE, (c) => ESC_MAP[c]);
 }
 
 const MARK_RE = /\p{M}/u;
+function finishSlug(out) {
+  if (out.length > 64) out = out.slice(0, 64);
+  if (out.length > 0) {
+    let e = out.length;
+    while (e > 0 && out.charCodeAt(e - 1) === 45) e--;
+    if (e < out.length) out = out.slice(0, e);
+  }
+  if (out === '') out = 'untitled';
+  return out;
+}
 function slugify(text, cache) {
   let s = cache.get(text);
   if (s !== undefined) return s;
+  // ASCII fast path: NFKD is the identity on ASCII and ASCII holds no
+  // combining marks, so skip normalize() and the per-char mark test.
+  let ascii = true;
+  for (let i = 0; i < text.length; i++) {
+    if (text.charCodeAt(i) > 127) { ascii = false; break; }
+  }
+  if (ascii) {
+    let out = '';
+    let pending = false;
+    for (let i = 0; i < text.length; i++) {
+      const c = text.charCodeAt(i);
+      if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57)) {
+        if (pending && out.length > 0) out += '-';
+        pending = false;
+        out += text[i];
+      } else if (c >= 65 && c <= 90) {
+        if (pending && out.length > 0) out += '-';
+        pending = false;
+        out += String.fromCharCode(c + 32);
+      } else {
+        pending = true;
+      }
+    }
+    s = finishSlug(out);
+    cache.set(text, s);
+    return s;
+  }
   const norm = text.normalize('NFKD');
   let out = '';
   let pending = false;
@@ -32,15 +71,9 @@ function slugify(text, cache) {
       pending = true;
     }
   }
-  if (out.length > 64) out = out.slice(0, 64);
-  if (out.length > 0) {
-    let e = out.length;
-    while (e > 0 && out.charCodeAt(e - 1) === 45) e--;
-    if (e < out.length) out = out.slice(0, e);
-  }
-  if (out === '') out = 'untitled';
-  cache.set(text, out);
-  return out;
+  s = finishSlug(out);
+  cache.set(text, s);
+  return s;
 }
 
 function uniqueSlug(base, taken) {
@@ -59,13 +92,16 @@ function dateLong(ds) {
   return d + ' ' + MONTHS[m - 1] + ' ' + ds.slice(0, 4);
 }
 
-function readingMinutes(body) {
+// Words in the body text from byte offset `off` on. The body text is the
+// source content string (lines joined with '\n', which is whitespace), so
+// scanning it directly counts the same words as the per-line version
+// without a join or a per-line loop.
+function readingMinutesText(s, off) {
   let n = 0;
   let inWord = false;
-  for (let i = 0; i < body.length; i++) {
-    const c = body.charCodeAt(i);
-    const ws = c === 32 || c === 9 || c === 10 || c === 11 || c === 12 || c === 13;
-    if (ws) inWord = false;
+  for (let i = off; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c === 32 || c === 9 || c === 10 || c === 11 || c === 12 || c === 13) inWord = false;
     else if (!inWord) { inWord = true; n++; }
   }
   let r = Math.ceil(n / 200);
@@ -74,7 +110,6 @@ function readingMinutes(body) {
 
 // ---------- front matter ----------
 
-const FM_KEY_RE = /^([a-z_]+):(?: (.*))?$/;
 const LAYOUT_RE = /^[a-z0-9-]+$/;
 const SLUG_KEY_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 const DATE_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
@@ -132,7 +167,7 @@ function parseTagsValue(v) {
   const parts = inside.split(',');
   const names = [];
   for (let p of parts) {
-    p = p.replace(/^[ \t]+/, '').replace(/[ \t]+$/, '');
+    p = trimST(p);
     if (p === '' || p.indexOf('"') !== -1 || p.indexOf('[') !== -1 || p.indexOf(']') !== -1) {
       throw new Error('key "tags": an empty tag, or one holding " [ or ]');
     }
@@ -141,8 +176,39 @@ function parseTagsValue(v) {
   return names;
 }
 
+function trimEndST(s) {
+  let b = s.length;
+  while (b > 0 && (s.charCodeAt(b - 1) === 32 || s.charCodeAt(b - 1) === 9)) b--;
+  return b === s.length ? s : s.slice(0, b);
+}
+
+function trimST(s) {
+  let a = 0, b = s.length;
+  while (a < b && (s.charCodeAt(a) === 32 || s.charCodeAt(a) === 9)) a++;
+  while (b > a && (s.charCodeAt(b - 1) === 32 || s.charCodeAt(b - 1) === 9)) b--;
+  return a === 0 && b === s.length ? s : s.slice(a, b);
+}
+
+// Parses one "key: value" line by hand: key [a-z_]+, ':', then end of line
+// or one space + rest. Returns {k, v} (v undefined when nothing follows
+// the colon) or null when the line has no such shape.
+function fmKeyLine(line) {
+  let ki = 0;
+  const n = line.length;
+  while (ki < n) {
+    const c = line.charCodeAt(ki);
+    if ((c >= 97 && c <= 122) || c === 95) ki++;
+    else break;
+  }
+  if (ki === 0) return null;
+  if (line.charCodeAt(ki) !== 58) return null; // ':'
+  if (ki + 1 === n) return { k: line.slice(0, ki), v: undefined };
+  if (line.charCodeAt(ki + 1) !== 32) return null;
+  return { k: line.slice(0, ki), v: line.slice(ki + 2) };
+}
+
 // Parses front matter of one source. `lines` is the source's lines (after
-// \r\n normalisation). Returns {data, body} or {error}.
+// \r\n normalisation). Returns {data, bodyLines, bodyStart} or {error}.
 function parseFrontMatter(lines) {
   if (lines.length === 0 || lines[0] !== '---') return { error: 'no front matter' };
   let close = -1;
@@ -154,18 +220,18 @@ function parseFrontMatter(lines) {
   const seen = new Set();
   for (let i = 1; i < close; i++) {
     const line = lines[i];
-    if (/^[ \t]*$/.test(line)) continue; // blank
+    if (isBlank(line)) continue; // blank
     if (line.charCodeAt(0) === 35) continue; // comment '#'
-    const m = FM_KEY_RE.exec(line);
-    if (!m) return { error: 'line ' + (i + 1) + ' is not "key: value"' };
-    const k = m[1];
+    const kv = fmKeyLine(line);
+    if (!kv) return { error: 'line ' + (i + 1) + ' is not "key: value"' };
+    const k = kv.k;
     if (k !== 'title' && k !== 'summary' && k !== 'date' && k !== 'tags' &&
         k !== 'draft' && k !== 'layout' && k !== 'slug') {
       return { error: 'unknown key "' + k + '"' };
     }
     if (seen.has(k)) return { error: 'key "' + k + '" is given twice' };
     seen.add(k);
-    let v = m[2] === undefined ? '' : m[2].replace(/[ \t]+$/, '');
+    let v = kv.v === undefined ? '' : trimEndST(kv.v);
     if (v === '') return { error: 'key "' + k + '" has no value' };
     try {
       if (k === 'title' || k === 'summary') data[k] = parseStringValue(k, v);
@@ -188,23 +254,90 @@ function parseFrontMatter(lines) {
     }
   }
   if (!seen.has('title')) return { error: 'no title' };
-  return { data, body: lines.slice(close + 1).join('\n') };
+  let bodyOff = 0;
+  for (let j = 0; j <= close; j++) bodyOff += lines[j].length + 1;
+  return { data, bodyLines: lines, bodyStart: close + 1, bodyOff };
 }
 
 // ---------- markdown ----------
+// Line classification by char codes (no regexes in the hot loop).
 
-const FENCE_RE = /^```([A-Za-z0-9_+\-]*)[ \t]*$/;
-const CLOSE_FENCE_RE = /^```[ \t]*$/;
-const HEADING_RE = /^(#{1,6})[ \t]+(.*)$/;
-const BREAK_RE = /^(---|\*\*\*)[ \t]*$/;
-const ORDERED_RE = /^(\d{1,9})\. /;
-const BLANK_RE = /^[ \t]*$/;
-const WS_RE = /\s/;
+function isBlank(line) {
+  for (let i = 0; i < line.length; i++) {
+    const c = line.charCodeAt(i);
+    if (c !== 32 && c !== 9) return false;
+  }
+  return true;
+}
+function trimLine(l) {
+  let a = 0, b = l.length;
+  while (a < b && (l.charCodeAt(a) === 32 || l.charCodeAt(a) === 9)) a++;
+  while (b > a && (l.charCodeAt(b - 1) === 32 || l.charCodeAt(b - 1) === 9)) b--;
+  return a === 0 && b === l.length ? l : l.slice(a, b);
+}
 
-function isBlank(line) { return BLANK_RE.test(line); }
-function trimLine(l) { return l.replace(/^[ \t]+/, '').replace(/[ \t]+$/, ''); }
+// Fence open: ``` + lang [A-Za-z0-9_+-]* + spaces/tabs only. Returns lang or null.
+function fenceLang(line) {
+  if (line.charCodeAt(0) !== 96 || line.charCodeAt(1) !== 96 || line.charCodeAt(2) !== 96) return null;
+  let i = 3;
+  const n = line.length;
+  while (i < n) {
+    const c = line.charCodeAt(i);
+    if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 95 || c === 43 || c === 45) i++;
+    else break;
+  }
+  const lang = line.slice(3, i);
+  while (i < n && (line.charCodeAt(i) === 32 || line.charCodeAt(i) === 9)) i++;
+  return i === n ? lang : null;
+}
+function isCloseFence(line) {
+  if (line.charCodeAt(0) !== 96 || line.charCodeAt(1) !== 96 || line.charCodeAt(2) !== 96) return false;
+  for (let i = 3; i < line.length; i++) {
+    const c = line.charCodeAt(i);
+    if (c !== 32 && c !== 9) return false;
+  }
+  return true;
+}
+// Heading: 1-6 '#', at least one space/tab, non-empty text (trailing trimmed).
+function headingInfo(line) {
+  let h = 0;
+  while (h < 6 && line.charCodeAt(h) === 35) h++;
+  if (h === 0) return null;
+  const c = line.charCodeAt(h);
+  if (c !== 32 && c !== 9) return null;
+  const text = trimLine(line.slice(h + 1));
+  if (text === '') return null;
+  return { level: h, text };
+}
+function isBreak(line) {
+  const c0 = line.charCodeAt(0);
+  if (c0 !== 45 && c0 !== 42) return false;
+  if (line.charCodeAt(1) !== c0 || line.charCodeAt(2) !== c0) return false;
+  for (let i = 3; i < line.length; i++) {
+    const c = line.charCodeAt(i);
+    if (c !== 32 && c !== 9) return false;
+  }
+  return true;
+}
+// Ordered list marker: 1-9 digits, '. ', returns {num, len} or null.
+function orderedInfo(line) {
+  let i = 0;
+  while (i < 9 && line.charCodeAt(i) >= 48 && line.charCodeAt(i) <= 57) i++;
+  if (i === 0) return null;
+  if (line.charCodeAt(i) !== 46 || line.charCodeAt(i + 1) !== 32) return null;
+  return { num: parseInt(line.slice(0, i), 10), len: i + 2 };
+}
+// List continuation: 2+ spaces then a non-space/tab character.
+function isContinuation(line) {
+  let i = 0;
+  while (line.charCodeAt(i) === 32) i++;
+  if (i < 2 || i >= line.length) return false;
+  const c = line.charCodeAt(i);
+  return c !== 32 && c !== 9;
+}
 
 const SCHEME_RE = /^[A-Za-z][A-Za-z0-9+.-]*:/;
+const WS_RE = /\s/;
 
 function resolveLink(target, B, srcDir, srcPath) {
   const c0 = target.charCodeAt(0);
@@ -277,7 +410,7 @@ function findBracketClose(s, from) {
   return -1;
 }
 
-const INLINE_SPECIAL = /[\\`*\[]/g;
+const INLINE_SPECIAL = /[\\`*\[&<>"']/g;
 
 function inlineRender(s, B, srcDir, srcPath) {
   let out = '';
@@ -287,12 +420,12 @@ function inlineRender(s, B, srcDir, srcPath) {
     INLINE_SPECIAL.lastIndex = i;
     const m = INLINE_SPECIAL.exec(s);
     const j = m ? m.index : n;
-    if (j > i) { out += esc(s.slice(i, j)); i = j; }
+    if (j > i) { out += s.slice(i, j); i = j; }
     if (i >= n) break;
     const c = s[i];
     if (c === '\\') {
       const nx = s[i + 1];
-      if (nx !== undefined && isEscapable(nx)) { out += esc(nx); i += 2; }
+      if (nx !== undefined && isEscapable(nx)) { out += nx === '>' ? '&gt;' : nx; i += 2; }
       else { out += '\\'; i += 1; }
     } else if (c === '`') {
       const k = s.indexOf('`', i + 1);
@@ -329,23 +462,11 @@ function inlineRender(s, B, srcDir, srcPath) {
       }
       if (!done) { out += '['; i += 1; }
     } else {
-      out += esc(c);
+      out += ESC_MAP[c];
       i += 1;
     }
   }
   return out;
-}
-
-function endsParagraph(l) {
-  if (isBlank(l)) return true;
-  const d0 = l.charCodeAt(0);
-  if (d0 === 96 && l.charCodeAt(1) === 96 && l.charCodeAt(2) === 96 && FENCE_RE.test(l)) return true;
-  if (d0 === 35) {
-    const m = HEADING_RE.exec(l);
-    if (m && m[2].replace(/[ \t]+$/, '') !== '') return true;
-  }
-  if ((d0 === 45 || d0 === 42) && BREAK_RE.test(l)) return true;
-  return false;
 }
 
 function tryList(lines, start, B, srcDir, srcPath) {
@@ -359,11 +480,11 @@ function tryList(lines, start, B, srcDir, srcPath) {
     kind = 'ul';
     text = first.slice(2);
   } else {
-    const m = ORDERED_RE.exec(first);
-    if (!m) return null;
+    const oi = orderedInfo(first);
+    if (!oi) return null;
     kind = 'ol';
-    startNum = parseInt(m[1], 10);
-    text = first.slice(m[0].length);
+    startNum = oi.num;
+    text = first.slice(oi.len);
   }
   const items = [[text]];
   let i = start + 1;
@@ -378,14 +499,14 @@ function tryList(lines, start, B, srcDir, srcPath) {
         continue;
       }
     } else {
-      const m = ORDERED_RE.exec(l);
-      if (m) {
-        items.push([l.slice(m[0].length)]);
+      const oi = orderedInfo(l);
+      if (oi) {
+        items.push([l.slice(oi.len)]);
         i++;
         continue;
       }
     }
-    if (/^ {2,}[^ \t]/.test(l)) {
+    if (isContinuation(l)) {
       items[items.length - 1].push(trimLine(l));
       i++;
       continue;
@@ -400,27 +521,26 @@ function tryList(lines, start, B, srcDir, srcPath) {
   return { html, next: i };
 }
 
-function renderMarkdown(body, B, srcPath, srcDir) {
-  const lines = body.split('\n');
+function renderMarkdown(lines, start, B, srcPath, srcDir) {
   const n = lines.length;
   const out = [];
   const toc = [];
   const headingIds = new Set();
   let excerpt = '';
   let excerptDone = false;
-  let i = 0;
+  let i = start;
   while (i < n) {
     const line = lines[i];
-    if (isBlank(line)) { i++; continue; }
+    if (line.length === 0) { i++; continue; }
     const c0 = line.charCodeAt(0);
+    if ((c0 === 32 || c0 === 9) && isBlank(line)) { i++; continue; }
     // fence
-    if (c0 === 96 && line.charCodeAt(1) === 96 && line.charCodeAt(2) === 96) {
-      const m = FENCE_RE.exec(line);
-      if (m) {
-        const lang = m[1];
+    if (c0 === 96) {
+      const lang = fenceLang(line);
+      if (lang !== null) {
         let code = '<pre><code' + (lang ? ' class="language-' + esc(lang) + '"' : '') + '>';
         i++;
-        while (i < n && !CLOSE_FENCE_RE.test(lines[i])) { code += esc(lines[i]) + '\n'; i++; }
+        while (i < n && !isCloseFence(lines[i])) { code += esc(lines[i]) + '\n'; i++; }
         if (i < n) i++;
         code += '</code></pre>\n';
         out.push(code);
@@ -429,22 +549,20 @@ function renderMarkdown(body, B, srcPath, srcDir) {
     }
     // heading
     if (c0 === 35) {
-      const m = HEADING_RE.exec(line);
-      if (m) {
-        const text = m[2].replace(/[ \t]+$/, '');
-        if (text !== '') {
-          const level = m[1].length;
-          const id = uniqueSlug(slugify(text, B.slugCache), headingIds);
-          const html = inlineRender(text, B, srcDir, srcPath);
-          out.push('<h' + level + ' id="' + id + '">' + html + '</h' + level + '>\n');
-          if (level === 2 || level === 3) toc.push({ level, id, html });
-          i++;
-          continue;
-        }
+      const hi = headingInfo(line);
+      if (hi) {
+        const level = hi.level;
+        const text = hi.text;
+        const id = uniqueSlug(slugify(text, B.slugCache), headingIds);
+        const html = inlineRender(text, B, srcDir, srcPath);
+        out.push('<h' + level + ' id="' + id + '">' + html + '</h' + level + '>\n');
+        if (level === 2 || level === 3) toc.push({ level, id, html });
+        i++;
+        continue;
       }
     }
     // thematic break
-    if ((c0 === 45 || c0 === 42) && BREAK_RE.test(line)) {
+    if ((c0 === 45 || c0 === 42) && isBreak(line)) {
       out.push('<hr>\n');
       i++;
       continue;
@@ -470,8 +588,18 @@ function renderMarkdown(body, B, srcPath, srcDir) {
     }
     // paragraph
     const parts = [];
-    while (i < n && !endsParagraph(lines[i])) {
-      parts.push(trimLine(lines[i]));
+    while (i < n) {
+      const l = lines[i];
+      if (l.length === 0) break;
+      const d0 = l.charCodeAt(0);
+      if (d0 === 32 || d0 === 9) { if (isBlank(l)) break; }
+      else if (d0 === 96) { if (fenceLang(l) !== null) break; }
+      else if (d0 === 35) { if (headingInfo(l) !== null) break; }
+      else if (d0 === 45 || d0 === 42) { if (isBreak(l)) break; }
+      // trimLine inline fast path: no leading/trailing space/tab
+      const last = l.charCodeAt(l.length - 1);
+      if (d0 !== 32 && d0 !== 9 && last !== 32 && last !== 9) parts.push(l);
+      else parts.push(trimLine(l));
       i++;
     }
     const html = inlineRender(parts.join('\n'), B, srcDir, srcPath);
@@ -633,12 +761,33 @@ function writeValue(v) {
   return '';
 }
 
+// writeValue then esc, as one call: the common template-var path is a
+// string, which this returns after a single escape test (no extra call).
+function escValue(v) {
+  if (typeof v === 'string') {
+    if (!ESC_TEST.test(v)) return v;
+    return v.replace(ESC_RE, (c) => ESC_MAP[c]);
+  }
+  if (typeof v === 'number') return String(v);
+  if (typeof v === 'boolean') return v ? 'true' : 'false';
+  if (Array.isArray(v)) {
+    let s = '';
+    for (let k = 0; k < v.length; k++) {
+      if (k > 0) s += ', ';
+      s += writeValue(v[k]);
+    }
+    if (!ESC_TEST.test(s)) return s;
+    return s.replace(ESC_RE, (c) => ESC_MAP[c]);
+  }
+  return '';
+}
+
 function truthy(v) {
   if (Array.isArray(v)) return v.length > 0;
   return v !== undefined && v !== null && v !== false && v !== '' && v !== 0;
 }
 
-const HELPERS = { esc, writeValue, truthy, g2, g3, gAll };
+const HELPERS = { esc, writeValue, escValue, truthy, g2, g3, gAll };
 
 function pathExpr(parts) {
   const first = JSON.stringify(parts[0]);
@@ -662,7 +811,7 @@ function compileTemplate(nodes) {
         const e = pathExpr(node.parts);
         code += node.raw
           ? 'out.push(H.writeValue(' + e + '));\n'
-          : 'out.push(H.esc(H.writeValue(' + e + ')));\n';
+          : 'out.push(H.escValue(' + e + '));\n';
       } else if (node.t === 'for') {
         const arr = pathExpr(node.parts);
         const nm = JSON.stringify(node.name);
@@ -722,7 +871,8 @@ export function run(input) {
   const statics = [];
   for (const f of files) {
     if (f.path.endsWith('.md')) {
-      sources.push({ path: f.path, content: f.content.replace(/\r\n?/g, '\n') });
+      const c = f.content;
+      sources.push({ path: f.path, content: c.indexOf('\r') === -1 ? c : c.replace(/\r\n?/g, '\n') });
     } else {
       statics.push(f);
       B.staticPathSet.add(f.path);
@@ -783,7 +933,10 @@ export function run(input) {
       tagNames: data.tags || [],
       layout,
       slugKey: data.slug || '',
-      body: fm.body,
+      bodyLines: fm.bodyLines,
+      bodyStart: fm.bodyStart,
+      bodyText: src.content,
+      bodyOff: fm.bodyOff,
     });
   }
 
@@ -802,11 +955,11 @@ export function run(input) {
 
   // 5. markdown
   for (const p of kept) {
-    const md = renderMarkdown(p.body, B, p.path, dirOf(p.path));
+    const md = renderMarkdown(p.bodyLines, p.bodyStart, B, p.path, dirOf(p.path));
     p.content = md.html;
     p.toc = md.toc;
     p.excerpt = md.excerpt;
-    p.readingMinutes = readingMinutes(p.body);
+    p.readingMinutes = readingMinutesText(p.bodyText, p.bodyOff);
   }
 
   // 6. collections
@@ -870,13 +1023,18 @@ export function run(input) {
     }
     return c;
   }
-  // page objects (card + extras)
+  // page objects (card fields + extras, built directly, same field order
+  // as the card plus slug/content/toc/newer/older/is_post)
   const pageObj = new Map();
   for (let i = 0; i < posts.length; i++) {
     const p = posts[i];
     const newer = i > 0 ? posts[i - 1] : null;
     const older = i < posts.length - 1 ? posts[i + 1] : null;
-    const po = Object.assign({}, cardOf(p), {
+    const c = cardOf(p);
+    pageObj.set(p.path, {
+      title: c.title, url: c.url, date: c.date, date_long: c.date_long,
+      summary: c.summary, excerpt: c.excerpt, reading_minutes: c.reading_minutes,
+      tags: c.tags,
       slug: p.slug,
       content: p.content,
       toc: p.toc,
@@ -884,11 +1042,14 @@ export function run(input) {
       older: older ? { title: older.title, url: older.url, date: older.date, date_long: dateLong(older.date) } : null,
       is_post: true,
     });
-    pageObj.set(p.path, po);
   }
   for (const p of kept) {
     if (p.isPost) continue;
-    const po = Object.assign({}, cardOf(p), {
+    const c = cardOf(p);
+    pageObj.set(p.path, {
+      title: c.title, url: c.url, date: c.date, date_long: c.date_long,
+      summary: c.summary, excerpt: c.excerpt, reading_minutes: c.reading_minutes,
+      tags: c.tags,
       slug: p.slug,
       content: p.content,
       toc: p.toc,
@@ -896,7 +1057,6 @@ export function run(input) {
       older: null,
       is_post: false,
     });
-    pageObj.set(p.path, po);
   }
   const recentCards = posts.slice(0, site.recent).map(cardOf);
   const siteObj = { title: site.title, base_url: base };
